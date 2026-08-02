@@ -1,0 +1,7 @@
+capture.jsonl
+capture.bin
+capture.txt
+secrets.yaml
+__pycache__/
+*.pyc
+.DS_Store
