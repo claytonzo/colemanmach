@@ -154,20 +154,67 @@ Confirmed facts, from live testing against `00:A0:50:4E:E5:07` on 2026-08-02:
   to this Pi's BlueZ version (5.86) or Bluetooth chip that's incompatible with how this
   thermostat expects pairing to be initiated.
 
-**Working theory, not yet confirmed:** since the manufacturer's own documentation
-describes entering the 6-digit code *inside the RV Climate app* rather than through a
-phone's OS-level Bluetooth pairing dialog, the real pairing/auth handshake this
-thermostat expects may not be standard BLE SMP pairing at all — it could be an
-application-layer scheme (e.g. connect without bonding, then something in the GATT
-traffic itself carries the code). We haven't found a write-target for that yet — none
-of the 8 characteristics above except mode/setpoint/zone-name are writable, and none
-looked like an obvious PIN-entry characteristic.
+**Resolved: it is standard BLE SMP pairing, not an app-layer scheme.** Confirmed by
+capturing the Android Bluetooth stack's own debug log (`adb bugreport`, since this
+OnePlus/Qualcomm build doesn't produce a standard `btsnoop_hci.log` — its logs live at
+`/data/misc/bluetooth/logs/bluetooth_*.log` inside the bug report, human-readable text
+not binary) while the RV Climate app reconnected to the thermostat:
 
-**Next diagnostic step (not yet done):** capture an HCI trace (`btmon` is available
-via BlueZ on the Pi) while pairing the *real* RV Climate phone app to this thermostat,
-to see the actual byte-for-byte handshake a working client performs. Replicating
-`bluetoothctl`'s generic pairing flow hasn't worked, so we need ground truth from a
-client that's known to work, not another guess.
+- The **AC itself sends an SMP `Security Request`** (`SMP_OPCODE_SEC_REQ`, `0x0b`)
+  immediately after ACL connection — pairing is peripheral-initiated by design, not
+  something the central is supposed to demand up front.
+- The phone had a real stored bond from previous use and re-encrypted using the stored
+  LTK (`LE_START_ENCRYPTION`, `use_stk:false`, `key_size:16`) — no fresh passkey
+  exchange needed, which is why "it didn't ask for the code" (see below, the 6-digit
+  code turned out to be **static per-unit, not rotating**, confirmed by the user).
+  This is a real link-layer bond, not application-layer trust.
+- GATT service discovery succeeds *before* encryption completes — matches our own
+  `enumerate.py` results (full service/characteristic table readable unbonded).
+
+This directly explains why `bluetoothctl pair` fails: it makes the **central** send an
+unsolicited `Pairing Request` the instant the link comes up, which is the wrong order
+for a peripheral that expects to initiate its own `Security Request` first. Tested the
+fix — plain `bluetoothctl connect` (not `pair`), with an agent already registered and
+`pairable on` set, so BlueZ could react to the AC's own request instead of us jumping
+ahead:
+
+- **Still fails**, but differently: not `ConnectionAttemptFailed` anymore — now
+  `Failed to connect: org.bluez.Error.Failed le-connection-abort-by-local`. Notice
+  "by-**local**" — this is *our own* Pi's BlueZ aborting the connection, not the AC
+  rejecting anything. Reproduced twice, including after a full adapter power-cycle
+  (`bluetoothctl power off`/`power on`) in between, so it isn't simply a wedged
+  adapter from repeated test attempts.
+- `dmesg` on the Pi shows kernel-level Bluetooth HCI errors correlating with these
+  attempts: `Bluetooth: hci0: Opcode 0x200e failed: -16` (`0x200e` =
+  `LE Create Connection Cancel`, `-16` = `EBUSY`) recurring across the session, and a
+  new `Bluetooth: hci0: ACL packet for unknown connection handle 64` right after the
+  post-reset retry — evidence of a connection-teardown race at the kernel/HCI level,
+  not a deliberate protocol rejection.
+- The Pi's adapter is a **Broadcom BCM4345C0** (onboard Pi 4 chip, confirmed via
+  `dmesg`: `hci0: BCM4345C0`). This exact error signature matches a known,
+  still-unresolved class of BlueZ↔Broadcom-Pi-firmware race conditions in LE
+  connection establishment — see
+  [bluez/bluez#2115](https://github.com/bluez/bluez/issues/2115) (same symptom: link
+  connects, dies in ~1s, no passkey ever requested, tried every standard
+  workaround, closed unresolved) and
+  [hbldh/bleak#1500](https://github.com/hbldh/bleak/issues/1500) (same opcode/error,
+  labeled a BlueZ-not-bleak issue).
+
+**Conclusion: this is very likely a hardware/firmware-level bug in the Pi's onboard
+Broadcom Bluetooth chip's interaction with BlueZ's LE connection state machine,
+specifically triggered by the timing of the AC's peripheral-initiated Security
+Request — not something fixable via `bluetoothctl` flags, agent capability choice, or
+protocol-level guessing from our side.** The mallorybowes README's standard pairing
+instructions likely do work on hardware that doesn't share this specific chip/BlueZ
+combination.
+
+**Next step (not yet tried): swap the Bluetooth adapter.** A USB BLE dongle with a
+different chipset (many cheap CSR/Intel-based ones are much better behaved with BlueZ
+on Linux than Broadcom's Pi firmware) is the most likely real fix — plug it in, repeat
+the exact `connect` sequence above, see if it pairs cleanly. If it does, that confirms
+the onboard chip as the culprit and the fix is permanent-hardware, not a workaround.
+An ESPHome Bluetooth proxy (already noted elsewhere as a fix for adapter *contention*)
+would be a second, independent way to sidestep this same chip.
 
 **macOS note:** CoreBluetooth (which `bleak` sits on top of) handles pairing at the OS
 level via a system dialog a script can't drive — do pairing work on the Pi (BlueZ),
