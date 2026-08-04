@@ -28,7 +28,10 @@ requires 3.10+. Use `Optional[X]` or skip annotations instead. (Same constraint 
 
 ## Device
 
-- **Hardware**: Coleman Mach / Airxcel Bluetooth Wall Thermostat, exact model still TBD
+- **Hardware**: Coleman Mach / Airxcel Bluetooth Wall Thermostat, **model confirmed
+  `9430-720` ("BLE Control Assembly")** — read from the HA device registry entry for
+  this unit (mfr "Coleman Mach / ICM Controls"), 2026-08-02. Same model mallorybowes'
+  community integration was tested against.
 - **BLE address (Linux MAC)**: `00:A0:50:4E:E5:07` — confirmed via HA Core's own
   passive Bluetooth scanner (`bluetooth/subscribe_advertisements` websocket command)
   and independently reconfirmed with `bluetoothctl`/`scan.py` from the Pi
@@ -83,47 +86,113 @@ python3 analyze.py capture.jsonl
 python3 monitor.py "<ADDRESS>"
 ```
 
-## Protocol — confirmed via live GATT dump (2026-08-02, `enumerate.py` from the Pi)
+## Protocol — confirmed via live reads (2026-08-02, bonded connection via USB dongle)
 
 **Service:** `c9282723-4680-491b-a904-c066fa81061f` — confirmed present.
 
-| Purpose | Characteristic UUID | Properties | Status |
-|---|---|---|---|
-| — (unknown) | `0575cdb7-d448-4bff-bc53-3b900d2a829f` | read | **New** — not in the reference doc. First-in-service-order; reading it (or, empirically, reading *any* characteristic first) always fails, see below. |
-| Mode | `9230a9ef-347c-4645-8fd9-cbb830d714bf` | read, write | Confirmed exists, matches reference |
-| — (unknown) | `8ca95e2d-daed-4b81-a91a-6eb46cb4ffac` | read | **New** — not in the reference doc, not in mallorybowes' `const.py` either as far as we've seen |
-| Zone name | `beb89473-05fe-41a0-9896-2c082660f19a` | read, write | Confirmed exists (reference doc said read-only; this unit's properties include write too) |
-| Unit ID | `e21b2b2c-379e-4166-b835-c71ef7eadfdf` | read | Matches `CHAR_UNIT_ID` from mallorybowes PR #1 — opaque binary, display as hex |
-| Room temperature | `382b4008-084a-4158-b378-66674091b1e2` | read | Confirmed exists, matches reference |
-| Setpoint | `09996813-fe7d-48ce-9b47-11634c80263c` | read, write | Confirmed exists, matches reference. Has a `0x2906` "Valid Range" descriptor — not yet read. |
-| Available modes | `3016e3fc-1dbb-455e-b268-80750e36c950` | read | Matches `CHAR_AVAILABLE_MODE` from mallorybowes PR #2 |
+All values below are **real reads off the actual thermostat**, taken right after a
+successful bond (see "Pairing" for how). This supersedes both the third-party
+reference and our own earlier pre-pairing GATT-only dump — two mappings from that
+earlier dump turned out to be wrong (see below).
+
+| Purpose | Characteristic UUID | Properties | Encoding | Observed value |
+|---|---|---|---|---|
+| Zone name | `beb89473-05fe-41a0-9896-2c082660f19a` | read, write | ASCII, 7 bytes, space-padded | `"       "` (unset) |
+| Room temperature | `382b4008-084a-4158-b378-66674091b1e2` | read | **2 bytes, little-endian uint16** — reference doc said 1 byte, that's wrong | `16 00` → 22, almost certainly °C (~72°F) |
+| Setpoint | `09996813-fe7d-48ce-9b47-11634c80263c` | read, write | 1 byte, raw °F. Has a `0x2906` "Valid Range" descriptor (unread) | `46` → 70°F |
+| Mode | `9230a9ef-347c-4645-8fd9-cbb830d714bf` | read, write | ASCII, space-padded to 14 chars + null (15 bytes) | `"OFF"` |
+| Available modes | `0575cdb7-d448-4bff-bc53-3b900d2a829f` | read | 10-byte positional bitmap, same scheme as mallorybowes PR #2's `CHAR_AVAILABLE_MODE` (`byte[i]==0x01` ⇒ `ALL_MODES[i]` supported) | `01 01 01 01 01 01 01 01 00 00` — COOL HIGH/AUTO-HIGH/AUTO-LOW/LOW, FAN HIGH/LOW, HEAT, HEAT ELEC all supported (heat/cool model, no heat pump/gas) |
+| Unit ID | `e21b2b2c-379e-4166-b835-c71ef7eadfdf` | read | 3 bytes, opaque binary — display as hex, matches mallorybowes PR #1 | `2c 24 31` → `2C2431` |
+| — (unknown) | `3016e3fc-1dbb-455e-b268-80750e36c950` | read | 1 byte | `01` — purpose unconfirmed |
+| — (unknown) | `8ca95e2d-daed-4b81-a91a-6eb46cb4ffac` | read | 2 bytes | `0d 34` — purpose unconfirmed |
+
+**Correction to earlier notes:** the *first* pre-pairing GATT dump (done before we
+could authenticate) mapped `0575cdb7-...` as "the always-fails-first unknown
+characteristic" and separately guessed `3016e3fc-...` was `CHAR_AVAILABLE_MODE` by
+UUID-position pattern-matching against mallorybowes' PR. Both were wrong: `0575cdb7-`
+**is** `CHAR_AVAILABLE_MODE` (confirmed by its actual 10-byte bitmap value matching
+that PR's documented scheme exactly); `3016e3fc-` is something else, still unknown.
+Lesson: don't trust UUID-position guesses against a third-party project's characteristic
+order — only a real read confirms what a characteristic is.
 
 Also present: standard GATT (`00001801`, Service Changed/indicate) and GAP
 (`00001800`: Device Name, Appearance, Peripheral Preferred Connection Parameters,
 Central Address Resolution, Resolvable Private Address Only) services — nothing
 thermostat-specific there.
 
-Candidate mode strings (still unverified against this unit): `OFF`, `FAN LOW`,
+Candidate mode strings (still only `OFF` observed live): `OFF`, `FAN LOW`,
 `FAN HIGH`, `COOL LOW`, `COOL HIGH`, `COOL AUTO LOW`, `COOL AUTO HIGH`, `HEAT`.
 
-**Read behavior on an unbonded connection:** every characteristic in the
-`c9282723-...` service is currently unreadable. The *first* read attempted in a fresh
-connection — whichever characteristic that happens to be, not specifically
-`0575cdb7-...` — fails with `GATT Protocol Error: Unlikely Error` (ATT code `0x0E`),
-and every subsequent read in that same connection then fails with "Service Discovery
-has not been performed yet" (BlueZ invalidates its service cache after the first
-error). `0x0E` is BlueZ's generic/undefined ATT error; well-behaved peripherals are
-supposed to return `0x05` (Insufficient Authentication) or `0x0F` (Insufficient
-Encryption) instead when the real problem is "you're not paired," so this looks like a
-firmware quirk on the thermostat's side rather than a bleak/BlueZ bug — but see
-"Pairing" below, since standard pairing doesn't get us there either.
+**Read behavior pre-pairing (historical, kept for context):** before a bond exists,
+every characteristic in this service was unreadable — the first read attempted always
+failed with `GATT Protocol Error: Unlikely Error` (ATT code `0x0E`), cascading into
+"Service Discovery has not been performed yet" for the rest. Once bonded, all reads
+above succeeded cleanly on the first try, no per-characteristic issues. So this was
+purely an authentication gate, not a device firmware bug as briefly suspected.
 
-Notify support: not yet determined for any characteristic — couldn't get far enough to
-check, since every characteristic is unreadable pre-pairing and pairing itself is the
-open problem (`capture.py` will report `properties` for each once a connection can
-actually read something).
+Notify support: not yet checked — everything so far has been polled via explicit
+`read`. Worth checking via `capture.py`/`enumerate.py`'s `properties` output on a
+future bonded session; none of the properties strings observed so far have included
+`notify`.
 
-## Pairing — reproducibly fails, root cause still open
+## Pairing — SOLVED: swap the Bluetooth adapter
+
+**Bottom line: pairing works fine — the Pi's onboard Broadcom BCM4345C0 chip
+could not do it, a USB Bluetooth dongle (ASUS USB-BT500, Realtek RTL8761B chipset,
+`idVendor=0b05 idProduct=1bf6`) can.** Confirmed 2026-08-02: `bluetoothctl connect`
+on the dongle got a real `Request passkey` / `Enter passkey (number in 0-999999):`
+prompt — something the onboard chip never once produced across dozens of attempts —
+and after entering the (static, per-unit, not rotating) 6-digit code `443649`, the
+device showed `Paired: yes`, `Bonded: yes`, `Connected: yes`. All characteristic
+reads in the Protocol table above were taken through this bonded connection.
+
+**Two things mattered for getting a clean result, beyond just having the dongle:**
+1. **Power off the onboard adapter** (`bluetoothctl select <onboard-MAC>; power off`)
+   while using the dongle. Physical proximity between two BT radios on the same board
+   caused real interference — one attempt with the onboard adapter mid-scan got the
+   thermostat itself to actively terminate the connection
+   (`org.bluez.Reason.Remote, Connection terminated by remote user`), which stopped
+   once the onboard radio was off.
+2. **Pairing mode has to actually be active at the moment `connect` fires**, not just
+   "recently triggered" — there's a real window (observed: roughly a minute or so,
+   not precisely measured) after holding UP+DOWN before it lapses back to normal
+   advertising (`ManufacturerData` flag `AA`→`00`). Several attempts failed simply
+   because relay/setup time between "user confirms pairing mode" and the actual
+   `connect` call ate into that window. Fastest reliable pattern: have the connect
+   script fully staged (agent registered, `pairable on` already set) *before* asking
+   the user to trigger pairing mode, so `connect` is the very next thing that happens.
+
+**Post-reboot gotcha:** HCI adapter indices are not stable across a Pi reboot — the
+USB dongle was `hci1` before a reboot and `hci0` after (the onboard chip swapped the
+other way). Adapter *addresses* (`A0:AD:9F:70:D8:B0` for the dongle,
+`2C:CF:67:2F:47:63` onboard) stay constant and are what `bluetoothctl select` should
+use — but anything hardcoding a `/org/bluez/hciN/dev_.../charXXXX` D-Bus object path
+(as our diagnostic scripts did) needs the `hciN` segment re-verified after any reboot
+via `bluetoothctl show <adapter-MAC>` or checking `dmesg` for which one loaded which
+firmware string (`BCM4345C0` = onboard, `Realtek`/`Bluetooth Controller` = dongle).
+
+**Also learned:** `bluetoothctl`'s own device cache is not durable — a device not
+actively re-scanned for a while (tens of minutes) drops out and `connect`/`info`
+report "not available" until a fresh `scan on` repopulates it. A short (5-8s) scan
+window is sometimes not enough right after a controller power-cycle or host reboot;
+give it 20-30s in a single sustained session (piping commands with real per-command
+delays, not separate one-shot `bluetoothctl <<<` invocations) rather than retrying
+several short ones.
+
+**What's now unnecessary to relitigate:** the earlier extensive root-causing below
+(Android snoop-log capture proving real SMP pairing peripheral-initiated by the AC,
+the `dmesg` kernel HCI race evidence on the Broadcom chip, the BlueZ GitHub issue
+precedent) was the right diagnostic path and is kept for reference — but the actual
+fix ended up being simpler than any further protocol-level investigation: different
+hardware. Don't spend more time on Broadcom-chip-specific `bluetoothctl` workarounds;
+use the dongle.
+
+---
+
+<details>
+<summary>Original investigation notes (kept for reference; superseded by the resolution above)</summary>
+
+### Pairing — reproducibly fails, root cause still open
 
 Confirmed facts, from live testing against `00:A0:50:4E:E5:07` on 2026-08-02:
 
@@ -190,8 +259,10 @@ ahead:
   new `Bluetooth: hci0: ACL packet for unknown connection handle 64` right after the
   post-reset retry — evidence of a connection-teardown race at the kernel/HCI level,
   not a deliberate protocol rejection.
-- The Pi's adapter is a **Broadcom BCM4345C0** (onboard Pi 4 chip, confirmed via
-  `dmesg`: `hci0: BCM4345C0`). This exact error signature matches a known,
+- The Pi's adapter is a **Broadcom BCM4345C0** (onboard chip, confirmed via
+  `dmesg`: `hci0: BCM4345C0`). Note: this host is a **Raspberry Pi 5**, not a Pi 4 as
+  earlier notes assumed — corrected 2026-08-02 against the live HA device registry, see
+  `../CLAUDE.md`. This exact error signature matches a known,
   still-unresolved class of BlueZ↔Broadcom-Pi-firmware race conditions in LE
   connection establishment — see
   [bluez/bluez#2115](https://github.com/bluez/bluez/issues/2115) (same symptom: link
@@ -220,12 +291,34 @@ would be a second, independent way to sidestep this same chip.
 level via a system dialog a script can't drive — do pairing work on the Pi (BlueZ),
 not from a Mac.
 
+**Reconciling with the on-Pi session's notes (synced 2026-08-02):** the separate
+Claude Code instance running directly on this RV's HA (`../Stanley-HA/CLAUDE.md`
+explains what that is) left a same-day note theorizing that no one had actually put the
+AC into its physical pairing mode before running `bluetoothctl pair`, and flagged that
+as an untried step. That's already covered by the testing above — our `pair` and
+`connect` attempts were both done with pairing mode confirmed active (LCD 6-digit code
+showing, `ManufacturerData` flag at `AA`) — and it still fails, just at a lower layer
+(Broadcom/BlueZ HCI race, not an instant application-level rejection). Worth relaying
+back to that session so it doesn't spend a retry re-confirming pairing mode; the more
+promising next move for either side is the adapter swap above.
+
+</details>
+
 ## Home Assistant add-on (`ha_addon/`)
 
-Not started. Once the protocol above is confirmed, model this on
+Not started, and now lower priority than getting the community integration working:
+the community's [mallorybowes/ha-coleman-mach-ble](https://github.com/mallorybowes/ha-coleman-mach-ble)
+custom_component is already installed on this HA instance and implements a full
+`climate` entity against this exact protocol. Now that pairing is solved (USB
+dongle), the next real step is pointing that integration's BLE connection at the
+dongle instead of the onboard adapter (its coordinator will need the same "select
+the right adapter" fix documented above), not writing a new add-on from scratch.
+
+If a from-scratch add-on ever becomes worthwhile, model it on
 `HA-VoltaApp/myvolta/ha_addon/`: persistent BLE connection (or poll loop, depending on
-notify support) → MQTT publish → HA auto-discovery sensors for mode/setpoint/room
-temp/zone name, plus climate-entity style mode/setpoint control back to the thermostat.
+notify support — not yet checked, see Protocol above) → MQTT publish → HA
+auto-discovery sensors for mode/setpoint/room temp/zone name, plus climate-entity
+style mode/setpoint control back to the thermostat.
 
 ## Deploying changes to the Pi
 
